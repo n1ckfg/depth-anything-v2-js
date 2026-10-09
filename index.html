@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Webcam Depth Estimation (Depth Anything V2)</title>
+    <style>
+      body { font-family: sans-serif; }
+      .controls > * { margin: 4px 0; }
+      #views { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
+      #views figure { margin: 0; }
+      #views video, #views canvas { width: 640px; max-width: 100%; height: auto; background: #222; display: block; }
+      #stats { font-family: monospace; }
+    </style>
+  </head>
+  <body>
+    <script src="./js/libraries/ort/ort.min.js"></script>
+
+    <div class="controls">
+      <div>
+        Backend:
+        <select id="backendEl">
+          <option value="auto">auto (WebGPU if available)</option>
+          <option value="webgpu">WebGPU</option>
+          <option value="wasm">WASM (CPU)</option>
+        </select>
+        <span id="backendInfo"></span>
+      </div>
+      <div>
+        Input size (short side):
+        <select id="sizeEl">
+          <option value="182">182</option>
+          <option value="252">252</option>
+          <option value="322">322</option>
+          <option value="392">392</option>
+          <option value="518">518 (native)</option>
+        </select>
+        Colormap:
+        <select id="colormapEl">
+          <option value="grey">greyscale</option>
+          <option value="turbo">turbo</option>
+        </select>
+      </div>
+      <div>
+        <button id="startBtn" onclick="toggle()" disabled>loading model...</button>
+        <span id="stats">FPS: -- | inference: -- ms</span>
+      </div>
+      <div id="statusEl"></div>
+    </div>
+
+    <div id="views">
+      <figure>
+        <video id="videoEl" autoplay playsinline muted></video>
+        <figcaption>webcam</figcaption>
+      </figure>
+      <figure>
+        <canvas id="outputCanvas" width="336" height="252"></canvas>
+        <figcaption>depth (near = bright)</figcaption>
+      </figure>
+    </div>
+
+    <p><a href="https://github.com/DepthAnything/Depth-Anything-V2">Depth Anything V2</a> - <a href="https://huggingface.co/onnx-community/depth-anything-v2-small">onnx model</a></p>
+
+    <script>
+      if(self.crossOriginIsolated) { // needs to be cross-origin-isolated to use wasm threads. you need to serve this html file with these two headers: https://web.dev/coop-coep/
+        ort.env.wasm.numThreads = navigator.hardwareConcurrency
+      }
+      ort.env.wasm.wasmPaths = new URL('./js/libraries/ort/', location.href).href; // must be absolute: the proxy worker runs from a blob: URL, so relative paths can't resolve
+
+      if(!window.OffscreenCanvas) alert("Your browser doesn't support OffscreenCanvas - a browser feature that was standardized way back in 2018. Please use a modern browser like Chrome, Edge or Brave.");
+
+      const MODEL_URL = "models/depth-anything-v2-small_fp16.onnx";
+      const PATCH_SIZE = 14; // ViT patch size: input height/width must be multiples of this
+      const MEAN = [0.485, 0.456, 0.406]; // ImageNet normalization used by Depth Anything
+      const STD = [0.229, 0.224, 0.225];
+
+      // Canvas used to scale webcam frames down to the model input resolution
+      const inputCanvas = new OffscreenCanvas(336, 252);
+      const inputCtx = inputCanvas.getContext("2d", { willReadFrequently: true });
+      const outputCtx = outputCanvas.getContext("2d");
+
+      let onnxSession;
+      let activeBackend = null;
+      let running = false;
+      let stream = null;
+
+      // Backend is chosen once per page load; input size and colormap can change while running.
+      const urlParams = new URLSearchParams(location.search);
+      const requestedBackend = ["auto", "webgpu", "wasm"].includes(urlParams.get("backend")) ? urlParams.get("backend") : "auto";
+      backendEl.value = requestedBackend;
+      backendEl.onchange = () => {
+        urlParams.set("backend", backendEl.value);
+        location.search = urlParams.toString();
+      };
+
+      sizeEl.value = [...sizeEl.options].some(o => o.value === urlParams.get("size")) ? urlParams.get("size") : "252";
+      colormapEl.value = [...colormapEl.options].some(o => o.value === urlParams.get("colormap")) ? urlParams.get("colormap") : "grey";
+      sizeEl.onchange = colormapEl.onchange = () => {
+        urlParams.set("size", sizeEl.value);
+        urlParams.set("colormap", colormapEl.value);
+        history.replaceState(null, "", "?" + urlParams.toString());
+      };
+
+      // Scales the short side to the selected size and the long side to keep the source aspect
+      // ratio, both rounded to a multiple of the patch size.
+      function getInputSize(srcWidth, srcHeight) {
+        const short = Number(sizeEl.value);
+        const long = Math.round(short * Math.max(srcWidth, srcHeight) / Math.min(srcWidth, srcHeight) / PATCH_SIZE) * PATCH_SIZE;
+        return srcWidth >= srcHeight ? { width: long, height: short } : { width: short, height: long };
+      }
+
+      async function isWebGPUAvailable() {
+        if(!navigator.gpu) return false;
+        try { return !!(await navigator.gpu.requestAdapter()); } catch(e) { return false; }
+      }
+
+      async function createSession(url, backend) {
+        // The proxy worker only supports the wasm EP; WebGPU must run on the main thread.
+        ort.env.wasm.proxy = backend === "wasm";
+        // "all" enables a layer-norm fusion that breaks on this fp16 export ("Attempting to get
+        // index by a name which does not exist: InsertedPrecisionFreeCast_..."), so stop at "extended".
+        return ort.InferenceSession.create(url, { executionProviders: [backend], graphOptimizationLevel: "extended" });
+      }
+
+      (async function() {
+        let backend = requestedBackend;
+        const hasWebGPU = await isWebGPUAvailable();
+
+        if (backend === "auto") {
+          backend = hasWebGPU ? "webgpu" : "wasm";
+        } else if (backend === "webgpu" && !hasWebGPU) {
+          statusEl.textContent = "WebGPU is not available in this browser - falling back to WASM.";
+          backend = "wasm";
+        }
+
+        console.log(`Downloading model ${MODEL_URL}... (see network tab for progress) [backend: ${backend}]`);
+        try {
+          onnxSession = await createSession(MODEL_URL, backend);
+        } catch(e) {
+          if(backend !== "webgpu") throw e;
+          console.warn("WebGPU session creation failed, falling back to WASM:", e);
+          statusEl.textContent = "WebGPU failed to initialize - falling back to WASM: " + (e.message || e);
+          backend = "wasm";
+          onnxSession = await createSession(MODEL_URL, backend);
+        }
+        activeBackend = backend;
+        backendInfo.textContent = backend === "webgpu"
+          ? "active: WebGPU"
+          : `active: WASM (${ort.env.wasm.numThreads || 1} threads${self.crossOriginIsolated ? "" : ", not cross-origin isolated"}${ort.env.wasm.proxy ? ", proxy worker" : ""})`;
+        console.log(`Model loaded (ORT ${ort.env.versions?.web ?? "?"}, backend: ${backend}).`);
+
+        // Warm up (assuming a 4:3 webcam) so shader compilation / first-run allocation isn't counted in FPS.
+        startBtn.textContent = "warming up...";
+        const { width, height } = getInputSize(4, 3);
+        const r = await benchmark(width, height, 3);
+        console.log(`Warmup ${width}x${height}: first run ${r.first.toFixed(0)}ms, then avg ${r.avg.toFixed(1)}ms`);
+
+        startBtn.disabled = false;
+        startBtn.textContent = "start webcam";
+      })().catch(e => {
+        console.error(e);
+        statusEl.textContent = "Failed to load model: " + (e.message || e);
+        startBtn.textContent = "model failed to load";
+      });
+
+      // Times inference on synthetic input (no webcam needed). Also callable from the console,
+      // e.g. `await benchmark(336, 252, 20)`, to compare backends/resolutions.
+      async function benchmark(width, height, iterations = 20) {
+        const times = [];
+        for(let i = 0; i < iterations; i++) {
+          const data = new Float32Array(3 * width * height); // all zeros = mean grey after normalization
+          const t = performance.now();
+          await onnxSession.run({ 'pixel_values': new ort.Tensor('float32', data, [1, 3, height, width]) });
+          times.push(performance.now() - t);
+        }
+        const rest = times.length > 1 ? times.slice(1) : times;
+        const avg = rest.reduce((a, b) => a + b, 0) / rest.length;
+        return { backend: activeBackend, width, height, first: times[0], avg, fps: 1000 / avg };
+      }
+
+      async function toggle() {
+        if(running) return stop();
+
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        } catch(e) {
+          statusEl.textContent = "Could not access webcam: " + e.message;
+          return;
+        }
+        videoEl.srcObject = stream;
+        await videoEl.play();
+
+        running = true;
+        statusEl.textContent = "";
+        startBtn.textContent = "stop";
+        loop();
+      }
+
+      function stop() {
+        running = false;
+        if(stream) stream.getTracks().forEach(t => t.stop());
+        stream = null;
+        videoEl.srcObject = null;
+        startBtn.textContent = "start webcam";
+      }
+
+      async function loop() {
+        let frameCount = 0;
+        let fpsWindowStart = performance.now();
+        let lastInferenceMs = 0;
+
+        while(running) {
+          const { width, height } = getInputSize(videoEl.videoWidth, videoEl.videoHeight);
+
+          try {
+            const data = videoFrameToPlanarRGB(videoEl, width, height);
+            const feeds = { 'pixel_values': new ort.Tensor('float32', data, [1, 3, height, width]) };
+
+            const t = performance.now();
+            const results = await onnxSession.run(feeds);
+            lastInferenceMs = performance.now() - t;
+
+            const out = results["predicted_depth"]; // relative inverse depth (larger = closer), shape [1, H, W]
+            drawDepthToCanvas(out.data, out.dims[2], out.dims[1]);
+            statusEl.textContent = "";
+          } catch(e) {
+            console.error(e);
+            statusEl.textContent = `Inference failed at ${width}x${height}: ${e.message || e}`;
+            await new Promise(r => setTimeout(r, 500)); // avoid spamming errors on a bad resolution
+          }
+
+          frameCount++;
+          const now = performance.now();
+          if(now - fpsWindowStart >= 1000) {
+            const fps = frameCount * 1000 / (now - fpsWindowStart);
+            stats.textContent = `FPS: ${fps.toFixed(1)} | inference: ${lastInferenceMs.toFixed(0)} ms | ${width}x${height}`;
+            frameCount = 0;
+            fpsWindowStart = now;
+          }
+
+          await new Promise(r => requestAnimationFrame(r)); // yield to the browser between frames
+        }
+
+        stats.textContent = "FPS: -- | inference: -- ms";
+      }
+
+      // Draws the current video frame into a width x height canvas (center-cropped to preserve
+      // aspect ratio) and returns planar, ImageNet-normalized RGB data with shape [3, height, width].
+      function videoFrameToPlanarRGB(video, width, height) {
+        if(inputCanvas.width !== width || inputCanvas.height !== height) {
+          inputCanvas.width = width;
+          inputCanvas.height = height;
+        }
+
+        const vw = video.videoWidth, vh = video.videoHeight;
+        const scale = Math.max(width / vw, height / vh);
+        const sw = width / scale, sh = height / scale;
+        const sx = (vw - sw) / 2, sy = (vh - sh) / 2;
+        inputCtx.drawImage(video, sx, sy, sw, sh, 0, 0, width, height);
+
+        const d = inputCtx.getImageData(0, 0, width, height).data;
+        const n = width * height;
+        const out = new Float32Array(3 * n); // fresh buffer each frame (the proxy worker may take ownership of it)
+        for(let i = 0, p = 0; p < n; i += 4, p++) {
+          out[p]         = (d[i]     / 255 - MEAN[0]) / STD[0]; // R
+          out[p + n]     = (d[i + 1] / 255 - MEAN[1]) / STD[1]; // G
+          out[p + 2 * n] = (d[i + 2] / 255 - MEAN[2]) / STD[2]; // B
+        }
+        return out;
+      }
+
+      // 256-entry RGB lookup tables, indexed by normalized depth (0 = far, 255 = near).
+      const COLORMAPS = {
+        grey: buildLUT(x => [x, x, x]),
+        // Polynomial approximation of Google's Turbo colormap
+        turbo: buildLUT(x => [
+          0.13572138 + x * (4.61539260 + x * (-42.66032258 + x * (132.13108234 + x * (-152.94239396 + x * 59.28637943)))),
+          0.09140261 + x * (2.19418839 + x * (4.84296658 + x * (-14.18503333 + x * (4.27729857 + x * 2.82956604)))),
+          0.10667330 + x * (12.64194608 + x * (-60.58204836 + x * (110.36276771 + x * (-89.90310912 + x * 27.34824973)))),
+        ]),
+      };
+      function buildLUT(fn) {
+        const lut = new Uint8ClampedArray(256 * 3);
+        for(let i = 0; i < 256; i++) lut.set(fn(i / 255).map(v => v * 255), i * 3);
+        return lut;
+      }
+
+      let outputImageData = null;
+      // Min/max-normalizes the relative depth map per frame and draws it through the selected colormap.
+      function drawDepthToCanvas(depthArr, width, height) {
+        if(outputCanvas.width !== width || outputCanvas.height !== height) {
+          outputCanvas.width = width;
+          outputCanvas.height = height;
+        }
+        if(!outputImageData || outputImageData.width !== width || outputImageData.height !== height) {
+          outputImageData = new ImageData(width, height);
+        }
+
+        let min = Infinity, max = -Infinity;
+        for(let i = 0; i < depthArr.length; i++) {
+          const v = depthArr[i];
+          if(v < min) min = v;
+          if(v > max) max = v;
+        }
+        const scale = max > min ? 255 / (max - min) : 0;
+
+        const lut = COLORMAPS[colormapEl.value];
+        const px = outputImageData.data;
+        for(let i = 0, j = 0; i < depthArr.length; i++, j += 4) {
+          const k = Math.round((depthArr[i] - min) * scale) * 3;
+          px[j] = lut[k]; px[j + 1] = lut[k + 1]; px[j + 2] = lut[k + 2]; px[j + 3] = 255;
+        }
+        outputCtx.putImageData(outputImageData, 0, 0);
+      }
+    </script>
+  </body>
+</html>
