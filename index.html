@@ -53,7 +53,7 @@
       </figure>
       <figure>
         <canvas id="outputCanvas" width="336" height="252"></canvas>
-        <figcaption>depth (near = bright)</figcaption>
+        <figcaption>relative depth (near = white / red, far = black / blue)</figcaption>
       </figure>
     </div>
 
@@ -115,9 +115,7 @@
       async function createSession(url, backend) {
         // The proxy worker only supports the wasm EP; WebGPU must run on the main thread.
         ort.env.wasm.proxy = backend === "wasm";
-        // "all" enables a layer-norm fusion that breaks on this fp16 export ("Attempting to get
-        // index by a name which does not exist: InsertedPrecisionFreeCast_..."), so stop at "extended".
-        return ort.InferenceSession.create(url, { executionProviders: [backend], graphOptimizationLevel: "extended" });
+        return ort.InferenceSession.create(url, { executionProviders: [backend] });
       }
 
       (async function() {
